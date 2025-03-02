@@ -3,7 +3,6 @@ import java.net.*;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,15 +26,16 @@ public class ProxyServer {
         this.fullProxyMode = fullProxyMode;
     }
 
-    record CacheEntry(byte[] response, Map<String, List<String>> headers, String responseFirstLine) implements Serializable {
+    record CacheEntry(byte[] response, Map<String, List<String>> headers,
+                      String responseFirstLine) implements Serializable {
     }
 
     record HttpRequest(String method, String url, String version, Map<String, List<String>> headers, byte[] body) {
     }
 
-    private void writeCacheEntryToFile(String key, CacheEntry cacheEntry) {
+    private void writeCacheEntryToFile(String cacheKey, CacheEntry cacheEntry) {
         try {
-            File file = new File(CACHE_DIR + File.separator + key);
+            File file = new File(CACHE_DIR + File.separator + cacheKey);
             if (!file.exists()) {
                 file.createNewFile();
             }
@@ -43,7 +43,7 @@ public class ProxyServer {
                 objectOutputStream.writeObject(cacheEntry);
             }
         } catch (IOException e) {
-            System.out.println("Error while writing cache entry to file: " + key);
+            System.out.println("Error while writing cache entry to file: " + cacheKey);
             throw new RuntimeException(e);
         }
     }
@@ -72,7 +72,7 @@ public class ProxyServer {
     }
 
     public void startServer() {
-        try(ServerSocket serverSocket = new ServerSocket(port)) {
+        try (ServerSocket serverSocket = new ServerSocket(port)) {
             System.out.println("Caching proxy server started on port " + port);
             System.out.println("Forwarding requests to " + origin);
             System.out.println("Press Ctrl+C to stop the server");
@@ -92,11 +92,13 @@ public class ProxyServer {
             OutputStream proxyToClientOutputSteam = clientSocket.getOutputStream();
 
             HttpRequest request = parseRequest(proxyToClientReader);
-            if(request == null) {
+
+            if (request == null) {
                 System.err.println("Empty request");
                 return;
             }
 
+            // When the client wants to establish a secure connection, it sends first a CONNECT request.
             if (request.method.equals("CONNECT")) {
                 handleConnectMethod(clientSocket, request.url);
                 return;
@@ -106,28 +108,33 @@ public class ProxyServer {
                 System.err.println("Host header not found");
                 return;
             }
-
             String cacheKey = createRequestHash(request);
             File cacheFile = new File(CACHE_DIR + File.separator + cacheKey);
 
-            if(cacheFile.exists()) {
-                CacheEntry cacheEntry = readCacheEntryFromFile(cacheFile);
-                sendResponseToClient(proxyToClientOutputSteam, cacheEntry, true);
-
+            if (cacheFile.exists()) {
+                sendResponseFromCache(cacheFile, proxyToClientOutputSteam);
             } else {
-                CacheEntry response = sendRequestToOriginServer(request);
-
-                System.out.println(response.headers.getClass());
-                writeCacheEntryToFile(cacheKey, response);
-                sendResponseToClient(proxyToClientOutputSteam, response, false);
+                fetchResponseAndStoreInCache(request, cacheKey, proxyToClientOutputSteam);
             }
-
             proxyToClientOutputSteam.close();
             clientSocket.close();
-
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private void fetchResponseAndStoreInCache(HttpRequest request, String cacheKey, OutputStream proxyToClientOutputSteam) throws IOException {
+        CacheEntry response = sendRequestToOriginServer(request);
+        if (response == null) {
+            return;
+        }
+        writeCacheEntryToFile(cacheKey, response);
+        sendResponseToClient(proxyToClientOutputSteam, response, false);
+    }
+
+    private void sendResponseFromCache(File cacheFile, OutputStream proxyToClientOutputSteam) throws IOException {
+        CacheEntry cacheEntry = readCacheEntryFromFile(cacheFile);
+        sendResponseToClient(proxyToClientOutputSteam, cacheEntry, true);
     }
 
     private String createRequestHash(HttpRequest request) {
@@ -164,10 +171,10 @@ public class ProxyServer {
         String url = requestLineParts[1];
         String version = requestLineParts[2];
 
-        // parse headers
+
         Map<String, List<String>> headers = new HashMap<>();
         while ((requestLine = proxyToClientReader.readLine()) != null && !requestLine.isEmpty()) {
-            if(requestLine.contains(":")) {
+            if (requestLine.contains(":")) {
                 headers.put(requestLine.split(":")[0].trim(), List.of(requestLine.split(":")[1].trim().split(", ")));
             }
         }
@@ -177,16 +184,21 @@ public class ProxyServer {
         }
 
         byte[] body = null;
-        if((method.equalsIgnoreCase("post") || method.equalsIgnoreCase("put")) && headers.containsKey("Content-Length")) {
-            int contentLength = Integer.parseInt(headers.get("Content-Length").get(0));
-            char[] content = new char[contentLength];
-            proxyToClientReader.read(content, 0, contentLength);
-            if(contentLength > 0) {
-                body = new String(content).getBytes();
-            }
+        if ((method.equalsIgnoreCase("post") || method.equalsIgnoreCase("put")) && headers.containsKey("Content-Length")) {
+            body = readRequestBody(proxyToClientReader, headers, body);
         }
 
         return new HttpRequest(method, url, version, headers, body);
+    }
+
+    private static byte[] readRequestBody(BufferedReader proxyToClientReader, Map<String, List<String>> headers, byte[] body) throws IOException {
+        int contentLength = Integer.parseInt(headers.get("Content-Length").getFirst());
+        char[] content = new char[contentLength];
+        proxyToClientReader.read(content, 0, contentLength);
+        if (contentLength > 0) {
+            body = new String(content).getBytes();
+        }
+        return body;
     }
 
     private void sendResponseToClient(OutputStream proxyToClientOutputSteam, CacheEntry response, boolean fromCache) throws IOException {
@@ -212,119 +224,152 @@ public class ProxyServer {
 
     private CacheEntry sendRequestToOriginServer(HttpRequest request) {
         try {
-            String method = request.method();
-            String url = request.url();
-            String version = request.version();
-            Map<String, List<String>> headers = request.headers();
-
-            byte[] response = null;
-            URL urlObj;
-            String pathStart = headers.get("Host").get(0).startsWith("http") ? "" : "http://";
-            URI uri = new URI( pathStart +
-                    headers.get("Host").getFirst() +url);
-            urlObj = URL.of(uri, null);
-
-            HttpURLConnection connection = (HttpURLConnection) urlObj.openConnection();
-
-            connection.setRequestMethod(method);
-            headers.forEach((key, value) -> {
-                if(!key.equalsIgnoreCase("Host") && !key.equalsIgnoreCase("Connection") && !key.equalsIgnoreCase("Proxy-Connection")) {
-                    connection.setRequestProperty(key, String.join(", ", value));
-                }
-            });
-            connection.setDoInput(true);
-            if(request.body() != null) {
-                connection.setDoOutput(true);
-                connection.getOutputStream().write(request.body());
+            URL urlObj = createUrlObject(request);
+            if(urlObj == null){
+                return null;
             }
-
-            String responseFirstLine = version + " " + connection.getResponseCode() + " " + connection.getResponseMessage();
-
-            Map<String, List<String>> responseHeaders = new HashMap<>();
-            connection.getHeaderFields().forEach((key, value) -> {
-                if(key != null) {
-                    responseHeaders.put(key, List.copyOf(value));
-                }
-            });
-
-            InputStream inputStream;
-            if(connection.getResponseCode() < 400) {
-                inputStream = connection.getInputStream();
-            } else {
-                inputStream = connection.getErrorStream();
-            }
-
-            if(inputStream != null) {
-                try(ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream()) {
-                    byte[] buffer = new byte[1024];
-                    int bytesRead;
-                    while ((bytesRead = inputStream.read(buffer)) != -1) {
-                        byteArrayOutputStream.write(buffer, 0, bytesRead);
-                    }
-                    response = byteArrayOutputStream.toByteArray();
-                } finally {
-                    inputStream.close();
-                }
-            }
-            return new CacheEntry(response, responseHeaders, responseFirstLine);
+            return getCacheEntryFromOrigin(request, urlObj);
 
         } catch (MalformedURLException e) {
             System.out.println("Malformed URL: " + request.url);
             throw new RuntimeException(e);
-        } catch (URISyntaxException | IOException e) {
+        } catch ( IOException e) {
             System.out.println("Error while sending request to origin server: " + request.url);
             throw new RuntimeException(e);
         }
 
     }
 
+    private CacheEntry getCacheEntryFromOrigin(HttpRequest request, URL urlObj) throws IOException {
+        byte[] response = null;
+
+        HttpURLConnection connection = (HttpURLConnection) urlObj.openConnection();
+
+        connection.setRequestMethod(request.method);
+        request.headers.forEach((key, value) -> {
+            if (!key.equalsIgnoreCase("Host") && !key.equalsIgnoreCase("Connection") && !key.equalsIgnoreCase("Proxy-Connection")) {
+                connection.setRequestProperty(key, String.join(", ", value));
+            }
+        });
+        connection.setDoInput(true);
+        if (request.body() != null) {
+            connection.setDoOutput(true);
+            connection.getOutputStream().write(request.body());
+        }
+
+        String responseFirstLine = request.version + " " + connection.getResponseCode() + " " + connection.getResponseMessage();
+
+        Map<String, List<String>> responseHeaders = new HashMap<>();
+        connection.getHeaderFields().forEach((key, value) -> {
+            if (key != null) {
+                responseHeaders.put(key, List.copyOf(value));
+            }
+        });
+
+        InputStream inputStream;
+        if (connection.getResponseCode() < 400) {
+            inputStream = connection.getInputStream();
+        } else {
+            inputStream = connection.getErrorStream();
+        }
+
+        if (inputStream != null) {
+            response = getBytesFromInputStream(inputStream);
+        }
+        connection.disconnect();
+
+        return new CacheEntry(response, responseHeaders, responseFirstLine);
+    }
+
+    private byte[] getBytesFromInputStream(InputStream inputStream) throws IOException {
+        byte[] response;
+        try (inputStream; ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream()) {
+            byte[] buffer = new byte[1024];
+            int bytesRead;
+            while ((bytesRead = inputStream.read(buffer)) != -1) {
+                byteArrayOutputStream.write(buffer, 0, bytesRead);
+            }
+            response = byteArrayOutputStream.toByteArray();
+        }
+        return response;
+    }
+
+    private URL createUrlObject(HttpRequest request){
+        String url = request.url();
+        Map<String, List<String>> headers = request.headers();
+        URL urlObj = null;
+        String pathStart = headers.get("Host").getFirst().startsWith("http") ? "" : "http://";
+        URI uri;
+        try {
+            uri = new URI(pathStart +
+                    headers.get("Host").getFirst() + url);
+        } catch (URISyntaxException e) {
+            System.err.println("String to URI conversion failed");
+            return null;
+        }
+        try {
+            urlObj = URL.of(uri, null);
+        } catch (MalformedURLException e) {
+            System.err.println("URL creation failed");
+        }
+        return urlObj;
+    }
+
     private void handleConnectMethod(Socket clientSocket, String url) {
         try {
-            // Parse the host and port from the URL (usually in format host:port)
-            String[] hostPort = url.split(":");
-            String host = hostPort[0];
-            int port = hostPort.length > 1 ? Integer.parseInt(hostPort[1]) : 443; // Default HTTPS port
-
-            // Tell the client the connection is established
-            PrintWriter out = new PrintWriter(clientSocket.getOutputStream());
-            out.println("HTTP/1.1 200 Connection Established");
-            out.println("Proxy-Agent: MyProxy");
-            out.println();
-            out.flush();
-
-            // Create a connection to the target server
-            Socket serverSocket = new Socket(host, port);
-
-            // Start two threads to relay data in both directions
-            Thread serverToClient = new Thread(() -> {
-                try {
-                    relay(serverSocket.getInputStream(), clientSocket.getOutputStream());
-                } catch (IOException e) {
-                    // Connection closed
-                }
-            });
-
-            Thread clientToServer = new Thread(() -> {
-                try {
-                    relay(clientSocket.getInputStream(), serverSocket.getOutputStream());
-                } catch (IOException e) {
-                    // Connection closed
-                }
-            });
-
-            serverToClient.start();
-            clientToServer.start();
-
-            // Wait for the threads to finish
-            serverToClient.join();
-            clientToServer.join();
-
-            // Close the sockets
-            serverSocket.close();
-
-        } catch (Exception e) {
-            e.printStackTrace();
+            Socket serverSocket = establishSocketConnectionToOrigin(url);
+            sendConnectionEstablishedMessage(clientSocket);
+            relayDataBeteweenOriginAndClient(clientSocket, serverSocket);
+        } catch (IOException e) {
+            System.out.println("Error while handling CONNECT method");
+        } catch (InterruptedException e) {
+            System.out.println("Thread interrupted");
         }
+    }
+
+    private void relayDataBeteweenOriginAndClient(Socket clientSocket, Socket serverSocket) throws InterruptedException, IOException {
+        Thread serverToClient = new Thread(() -> {
+            try {
+                relay(serverSocket.getInputStream(), clientSocket.getOutputStream());
+            } catch (IOException e) {
+                System.out.println("Connection closed");
+            }
+        });
+
+        Thread clientToServer = new Thread(() -> {
+            try {
+                relay(clientSocket.getInputStream(), serverSocket.getOutputStream());
+            } catch (IOException e) {
+                System.out.println("Connection closed");
+            }
+        });
+
+        serverToClient.start();
+        clientToServer.start();
+
+        // Wait for the threads to finish
+        serverToClient.join();
+        clientToServer.join();
+
+        // Close the sockets
+        serverSocket.close();
+    }
+
+    private static void sendConnectionEstablishedMessage(Socket clientSocket) throws IOException {
+        PrintWriter out = new PrintWriter(clientSocket.getOutputStream());
+        out.println("HTTP/1.1 200 Connection Established");
+        out.println("Proxy-Agent: MyProxy");
+        out.println();
+        out.flush();
+    }
+
+    private static Socket establishSocketConnectionToOrigin(String url) throws IOException {
+        String[] hostPort = url.split(":");
+        String host = hostPort[0];
+        int port = hostPort.length > 1 ? Integer.parseInt(hostPort[1]) : 443; // Default HTTPS port
+
+        // Create a connection to the target server
+        return new Socket(host, port);
     }
 
     private void relay(InputStream in, OutputStream out) throws IOException {
